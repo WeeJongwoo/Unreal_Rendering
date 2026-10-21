@@ -1,0 +1,71 @@
+// MosaicMaterial.ush
+// 포스트 프로세스 머티리얼 Custom 노드 전용 함수. (Include File Paths: /CustomShaders/MosaicMaterial.ush)
+// PostProcessInput0 를 직접 여러 번 샘플해야 해서 SceneTextureLookup(MaterialTemplate.ush) 을 사용한다.
+
+#pragma once
+
+#include "/CustomShaders/Mosaic.ush"
+
+#if POST_PROCESS_MATERIAL
+
+float4 MosaicLoadPostProcessInput0(float2 LocalPixel)
+{
+	LocalPixel = clamp(LocalPixel, 0.5, PostProcessInput_0_ViewportSize - 0.5);
+	const float2 ViewportUV = LocalPixel * PostProcessInput_0_ViewportSizeInverse;
+	return SceneTextureLookup(ViewportUVToSceneTextureUV(ViewportUV, PPI_PostProcessInput0), PPI_PostProcessInput0, false);
+}
+
+// Method 0 = 블록 중심 1-tap, 1 = 블록 N*N 평균
+float4 MosaicMaterial(float2 ViewportUV, float BlockSize, int Method)
+{
+	BlockSize = max(BlockSize, 1.0);
+	const float2 ViewportSize = PostProcessInput_0_ViewportSize;
+	const float2 LocalPos = ViewportUV * ViewportSize;
+	const uint2 BlockIndex = MosaicGetBlockIndex(LocalPos, BlockSize);
+
+	BRANCH
+	if (Method == 0)
+	{
+		return MosaicLoadPostProcessInput0(floor(MosaicGetBlockCenter(BlockIndex, BlockSize, ViewportSize)) + 0.5);
+	}
+
+	float2 BlockMin, BlockMax;
+	MosaicGetBlockBounds(BlockIndex, BlockSize, ViewportSize, BlockMin, BlockMax);
+
+	float4 Sum = 0;
+	LOOP
+	for (float y = BlockMin.y; y < BlockMax.y; y += 1.0)
+	{
+		LOOP
+		for (float x = BlockMin.x; x < BlockMax.x; x += 1.0)
+		{
+			Sum += MosaicLoadPostProcessInput0(float2(x, y) + 0.5);
+		}
+	}
+	const float2 BlockExtent = BlockMax - BlockMin;
+	return Sum / (BlockExtent.x * BlockExtent.y);
+}
+
+// CustomStencil 이 StencilValue 와 같으면 1
+float MosaicMaterialStencilMask(float2 ViewportUV, float StencilValue)
+{
+	const float Stencil = SceneTextureLookup(ViewportUVToSceneTextureUV(ViewportUV, PPI_CustomStencil), PPI_CustomStencil, false).r;
+	return abs(Stencil - StencilValue) < 0.5 ? 1.0 : 0.0;
+}
+
+#else // POST_PROCESS_MATERIAL
+
+// 머티리얼은 여러 쉐이더 타입으로 컴파일되는데, POST_PROCESS_MATERIAL=1 은 포스트 프로세스 PS 에서만 정의된다.
+// 그 밖의 컴파일에서도 Custom 노드가 함수를 찾을 수 있도록 같은 시그니처의 대체 함수를 둔다.
+// 화면이 마젠타로 보이면 Material Domain 이 Post Process 가 아니라는 뜻이다.
+float4 MosaicMaterial(float2 ViewportUV, float BlockSize, int Method)
+{
+	return float4(1, 0, 1, 1);
+}
+
+float MosaicMaterialStencilMask(float2 ViewportUV, float StencilValue)
+{
+	return 1.0;
+}
+
+#endif // POST_PROCESS_MATERIAL

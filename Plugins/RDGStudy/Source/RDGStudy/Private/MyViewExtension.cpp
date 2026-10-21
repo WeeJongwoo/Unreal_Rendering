@@ -8,6 +8,12 @@
 #include "ShaderParameterStruct.h"
 
 DECLARE_GPU_DRAWCALL_STAT(TrianglePass);
+
+static TAutoConsoleVariable<int32> CVarRDGStudyTriangle(
+    TEXT("r.RDGStudy.Triangle"), 0,
+    TEXT("RDG 삼각형 테스트 패스 (0: off, 1: on)"),
+    ECVF_RenderThreadSafe);
+
 FMyViewExtension::FMyViewExtension(const FAutoRegister& AutoRegister) : FSceneViewExtensionBase(AutoRegister) {
 
 }
@@ -15,7 +21,7 @@ FMyViewExtension::FMyViewExtension(const FAutoRegister& AutoRegister) : FSceneVi
 void FMyViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass Pass, FAfterPassCallbackDelegateArray&
 InOutPassCallbacks, bool bIsPassEnabled)
 {
-	if (Pass == EPostProcessingPass::Tonemap)
+	if (Pass == EPostProcessingPass::Tonemap && CVarRDGStudyTriangle.GetValueOnRenderThread() != 0)
 	{
 	// Create Raw Delegate Here, see later on
         InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FMyViewExtension::TrianglePass_RenderThread));

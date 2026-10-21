@@ -1,0 +1,28 @@
+// Mosaic.ush
+// 글로벌 쉐이더(Mosaic.usf)와 머티리얼 Custom 노드(MosaicMaterial.ush)가 공유하는 순수 HLSL 함수.
+// 엔진 헤더에 의존하지 않는다.
+//
+// 블록 그리드는 "입력 뷰포트 로컬 픽셀 공간"(뷰포트 좌상단 = (0,0))에서 정의된다.
+
+#pragma once
+
+// 로컬 픽셀 좌표가 속한 블록 인덱스
+uint2 MosaicGetBlockIndex(float2 LocalPixelPos, float BlockSize)
+{
+	return (uint2)floor(LocalPixelPos / BlockSize);
+}
+
+// 블록이 차지하는 픽셀 범위 [BlockMin, BlockMax). 뷰포트 가장자리의 블록은 잘린다.
+void MosaicGetBlockBounds(uint2 BlockIndex, float BlockSize, float2 ViewportSize, out float2 BlockMin, out float2 BlockMax)
+{
+	BlockMin = (float2)BlockIndex * BlockSize;
+	BlockMax = min(BlockMin + BlockSize, ViewportSize);
+}
+
+// (잘린) 블록 중심의 로컬 픽셀 좌표
+float2 MosaicGetBlockCenter(uint2 BlockIndex, float BlockSize, float2 ViewportSize)
+{
+	float2 BlockMin, BlockMax;
+	MosaicGetBlockBounds(BlockIndex, BlockSize, ViewportSize, BlockMin, BlockMax);
+	return (BlockMin + BlockMax) * 0.5;
+}

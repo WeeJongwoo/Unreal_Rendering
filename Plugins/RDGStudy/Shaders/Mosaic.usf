@@ -1,0 +1,194 @@
+// Mosaic.usf
+// r.Mosaic.Method 별 구현
+//  0 (A) MosaicPS, MOSAIC_METHOD=0 : 블록 중심 1-tap 포인트 샘플
+//  1 (B) MosaicPS, MOSAIC_METHOD=1 : 픽셀마다 블록 전체 N*N Load 후 평균 (기준선, 매우 느림)
+//  2 (C) MosaicDownsamplePS -> MosaicUpsamplePS : 블록당 1픽셀 저해상도 RT, bilinear tap 으로 2x2 를 한 번에
+//  3 (D) MosaicReduceCS     -> MosaicUpsamplePS : 블록당 스레드 그룹 1개, groupshared 리덕션
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/CustomShaders/Mosaic.ush"
+
+#ifndef MOSAIC_METHOD
+#define MOSAIC_METHOD 0
+#endif
+
+#ifndef MOSAIC_USE_STENCIL
+#define MOSAIC_USE_STENCIL 0
+#endif
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 8
+#endif
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+float BlockSize;
+
+Texture2D<uint2> CustomStencilTexture;
+int2 StencilViewportMin;
+float2 StencilViewportSize;
+uint StencilValue;
+
+Texture2D LowResTexture;
+RWTexture2D<float4> RWLowResTexture;
+
+// 입력 뷰포트 로컬 픽셀 좌표로 Load (뷰포트 밖은 가장자리로 클램프)
+float4 LoadInput(int2 LocalPixel)
+{
+	LocalPixel = clamp(LocalPixel, 0, (int2)Input_ViewportSize - 1);
+	return InputTexture.Load(int3(Input_ViewportMin + LocalPixel, 0));
+}
+
+// 출력 SV_Position -> 뷰포트 UV
+float2 GetViewportUV(float2 SvPosition)
+{
+	return (SvPosition - Output_ViewportMin) * Output_ViewportSizeInverse;
+}
+
+#if MOSAIC_USE_STENCIL
+// CustomStencil 은 렌더 해상도, SceneColor 는 (TSR 이후) 출력 해상도일 수 있으므로 UV 로 변환한다.
+bool IsMosaicMasked(float2 ViewportUV)
+{
+	const int2 StencilPixel = StencilViewportMin + (int2)(ViewportUV * StencilViewportSize);
+	return CustomStencilTexture.Load(int3(StencilPixel, 0)) STENCIL_COMPONENT_SWIZZLE == StencilValue;
+}
+#endif
+
+// ---------------------------------------------------------------------------------------
+// A / B : 단일 풀스크린 패스
+// 픽셀 쉐이더 입력은 FScreenPassVS 출력(TEXCOORD0, SV_POSITION)과 구성이 같아야 D3D12 PSO 생성이 성공한다.
+void MosaicPS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float2 ViewportUV = GetViewportUV(SvPosition.xy);
+	const float2 LocalPos = ViewportUV * Input_ViewportSize;
+
+#if MOSAIC_USE_STENCIL
+	BRANCH
+	if (!IsMosaicMasked(ViewportUV))
+	{
+		OutColor = LoadInput((int2)LocalPos);
+		return;
+	}
+#endif
+
+	const uint2 BlockIndex = MosaicGetBlockIndex(LocalPos, BlockSize);
+
+#if MOSAIC_METHOD == 0
+	OutColor = LoadInput((int2)MosaicGetBlockCenter(BlockIndex, BlockSize, Input_ViewportSize));
+#else
+	float2 BlockMin, BlockMax;
+	MosaicGetBlockBounds(BlockIndex, BlockSize, Input_ViewportSize, BlockMin, BlockMax);
+
+	// 블록 안의 모든 픽셀이 같은 N*N 루프를 반복한다 -> 픽셀당 N^2 Load
+	float4 Sum = 0;
+	LOOP
+	for (int y = (int)BlockMin.y; y < (int)BlockMax.y; ++y)
+	{
+		LOOP
+		for (int x = (int)BlockMin.x; x < (int)BlockMax.x; ++x)
+		{
+			Sum += LoadInput(int2(x, y));
+		}
+	}
+	const float2 BlockExtent = BlockMax - BlockMin;
+	OutColor = Sum / (BlockExtent.x * BlockExtent.y);
+#endif
+}
+
+// ---------------------------------------------------------------------------------------
+// C : 저해상도 다운샘플. 출력 RT 의 픽셀 하나 = 블록 하나.
+// 2x2 텍셀의 공통 꼭짓점을 bilinear 로 샘플하면 4텍셀 평균을 1 fetch 로 얻는다 -> 블록당 N^2/4 tap.
+// (BlockSize 는 C++ 에서 짝수로 맞춘다. 뷰포트 가장자리의 홀수 폭 블록은 클램프로 인해 약간 치우친다.)
+void MosaicDownsamplePS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const uint2 BlockIndex = (uint2)SvPosition.xy;
+
+	float2 BlockMin, BlockMax;
+	MosaicGetBlockBounds(BlockIndex, BlockSize, Input_ViewportSize, BlockMin, BlockMax);
+
+	float4 Sum = 0;
+	float TapCount = 0;
+	LOOP
+	for (float y = BlockMin.y; y < BlockMax.y; y += 2.0)
+	{
+		LOOP
+		for (float x = BlockMin.x; x < BlockMax.x; x += 2.0)
+		{
+			const float2 CornerPixel = Input_ViewportMin + float2(x, y) + 1.0;
+			const float2 UV = clamp(CornerPixel * Input_ExtentInverse, Input_UVViewportBilinearMin, Input_UVViewportBilinearMax);
+			Sum += InputTexture.SampleLevel(InputSampler, UV, 0);
+			TapCount += 1.0;
+		}
+	}
+	OutColor = Sum / max(TapCount, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------
+// D : 컴퓨트 리덕션. 스레드 그룹 하나가 블록 하나를 담당한다.
+groupshared float4 SharedSum[THREADGROUP_SIZE * THREADGROUP_SIZE];
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MosaicReduceCS(
+	uint2 GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint GroupIndex : SV_GroupIndex)
+{
+	float2 BlockMin, BlockMax;
+	MosaicGetBlockBounds(GroupId, BlockSize, Input_ViewportSize, BlockMin, BlockMax);
+	const int2 Min = (int2)BlockMin;
+	const int2 Max = (int2)BlockMax;
+
+	// 1) 각 스레드가 THREADGROUP_SIZE 간격으로 블록을 훑으며 부분합 (메모리 접근은 그룹 내에서 연속)
+	float4 Sum = 0;
+	LOOP
+	for (int y = Min.y + (int)GroupThreadId.y; y < Max.y; y += THREADGROUP_SIZE)
+	{
+		LOOP
+		for (int x = Min.x + (int)GroupThreadId.x; x < Max.x; x += THREADGROUP_SIZE)
+		{
+			Sum += InputTexture.Load(int3(Input_ViewportMin + int2(x, y), 0));
+		}
+	}
+	SharedSum[GroupIndex] = Sum;
+	GroupMemoryBarrierWithGroupSync();
+
+	// 2) groupshared 트리 리덕션: 64 -> 1
+	UNROLL
+	for (uint Stride = (THREADGROUP_SIZE * THREADGROUP_SIZE) / 2; Stride > 0; Stride >>= 1)
+	{
+		if (GroupIndex < Stride)
+		{
+			SharedSum[GroupIndex] += SharedSum[GroupIndex + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (GroupIndex == 0)
+	{
+		const int2 Extent = Max - Min;
+		RWLowResTexture[GroupId] = SharedSum[0] / (float)(Extent.x * Extent.y);
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// C / D 공용 : 저해상도 결과를 블록 단위로 포인트 업스케일
+void MosaicUpsamplePS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float2 ViewportUV = GetViewportUV(SvPosition.xy);
+	const float2 LocalPos = ViewportUV * Input_ViewportSize;
+
+#if MOSAIC_USE_STENCIL
+	BRANCH
+	if (!IsMosaicMasked(ViewportUV))
+	{
+		OutColor = LoadInput((int2)LocalPos);
+		return;
+	}
+#endif
+
+	OutColor = LowResTexture.Load(int3(MosaicGetBlockIndex(LocalPos, BlockSize), 0));
+}

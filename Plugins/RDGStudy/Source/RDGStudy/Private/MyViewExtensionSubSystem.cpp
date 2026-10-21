@@ -1,6 +1,7 @@
 ﻿#include "MyViewExtensionSubSystem.h"
 #include "SceneViewExtension.h"
 #include "MyViewExtension.h"
+#include "MosaicViewExtension.h"
 
 void UMyViewExtensionSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -9,4 +10,5 @@ void UMyViewExtensionSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 	// This is the Pointer to the FSceneViewExenstion you will see later on
 	// You need this line to run your shader.
 	this->ShaderTest = FSceneViewExtensions::NewExtension<FMyViewExtension>().ToSharedPtr();
+	this->MosaicExtension = FSceneViewExtensions::NewExtension<FMosaicViewExtension>().ToSharedPtr();
 }
